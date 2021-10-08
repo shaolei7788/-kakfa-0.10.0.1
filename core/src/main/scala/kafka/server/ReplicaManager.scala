@@ -100,6 +100,7 @@ object ReplicaManager {
   val IsrChangePropagationInterval = 60000L
 }
 
+
 class ReplicaManager(val config: KafkaConfig,
                      metrics: Metrics,
                      time: Time,
