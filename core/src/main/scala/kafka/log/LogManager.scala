@@ -37,6 +37,8 @@ import java.util.concurrent.{ExecutionException, ExecutorService, Executors, Fut
  * 
  * A background thread handles log retention by periodically truncating excess log segments.
  */
+//每个数据目录对应一个全局的检查点文件，检查点文件会存储这个数据目录下所有日志的检查点信息，检查点表示日志已经刷新到磁盘的位置，主要用于故障的恢复
+//定时将所有分区副本的偏移量,刷写到恢复点文件
 @threadsafe
 class LogManager(val logDirs: Array[File],
                  val topicConfigs: Map[String, LogConfig],
@@ -49,18 +51,23 @@ class LogManager(val logDirs: Array[File],
                  scheduler: Scheduler,
                  val brokerState: BrokerState,
                  private val time: Time) extends Logging {
+  //记录每个分区的偏移量
   val RecoveryPointCheckpointFile = "recovery-point-offset-checkpoint"
+  //为每个log目录文件加锁
   val LockFile = ".lock"
   val InitialTaskDelayMs = 30*1000
   private val logCreationOrDeletionLock = new Object
+  //记录每个分区对应的Log对象
   private val logs = new Pool[TopicAndPartition, Log]()
 
   createAndValidateLogDirs(logDirs)
   private val dirLocks = lockLogDirs(logDirs)
+  //一个数据目录 对应一个线程
   private val recoveryPointCheckpoints = logDirs.map(dir => (dir, new OffsetCheckpoint(new File(dir, RecoveryPointCheckpointFile)))).toMap
+  //todo 加载日志
   loadLogs()
 
-  // public, so we can access this from kafka.admin.DeleteTopicTest
+  //日志清理的管理类 这里的清理是日志压缩
   val cleaner: LogCleaner =
     if(cleanerConfig.enableCleaner)
       new LogCleaner(cleanerConfig, logDirs, logs, time = time)
@@ -85,6 +92,7 @@ class LogManager(val logDirs: Array[File],
         if(!created)
           throw new KafkaException("Failed to create data directory " + dir.getAbsolutePath)
       }
+      //是否是目录 是否可读
       if(!dir.isDirectory || !dir.canRead)
         throw new KafkaException(dir.getAbsolutePath + " is not a readable log directory.")
     }
@@ -111,13 +119,14 @@ class LogManager(val logDirs: Array[File],
 
     val threadPools = mutable.ArrayBuffer.empty[ExecutorService]
     val jobs = mutable.Map.empty[File, Seq[Future[_]]]
-
+    //遍历数据目录
     for (dir <- this.logDirs) {
+      //ioThreads 默认为1
       val pool = Executors.newFixedThreadPool(ioThreads)
       threadPools.append(pool)
-
+      //检测上一次关闭是否是正常关闭
       val cleanShutdownFile = new File(dir, Log.CleanShutdownFile)
-
+      //存在则表示kafka正在经历清理性的停机工作，此时跳过从本文件夹恢复日志
       if (cleanShutdownFile.exists) {
         debug(
           "Found clean shutdown file. " +
@@ -139,16 +148,19 @@ class LogManager(val logDirs: Array[File],
       }
 
       val jobsForDir = for {
+        //获取该目录下的每个文件
         dirContent <- Option(dir.listFiles).toList
+        //返回是Log目录 logDir = /opt/module/logs/first-0
         logDir <- dirContent if logDir.isDirectory
       } yield {
+        //封装成一个线程
         CoreUtils.runnable {
           debug("Loading log '" + logDir.getName + "'")
 
           val topicPartition = Log.parseTopicPartitionName(logDir)
           val config = topicConfigs.getOrElse(topicPartition.topic, defaultConfig)
           val logRecoveryPoint = recoveryPoints.getOrElse(topicPartition, 0L)
-
+          //创建log对象
           val current = new Log(logDir, config, logRecoveryPoint, scheduler, time)
           val previous = this.logs.put(topicPartition, current)
 
@@ -159,7 +171,7 @@ class LogManager(val logDirs: Array[File],
           }
         }
       }
-
+      //提交任务
       jobs(cleanShutdownFile) = jobsForDir.map(pool.submit).toSeq
     }
 
@@ -188,25 +200,35 @@ class LogManager(val logDirs: Array[File],
     /* Schedule the cleanup task to delete old logs */
     if(scheduler != null) {
       info("Starting log cleanup with a period of %d ms.".format(retentionCheckMs))
-      scheduler.schedule("kafka-log-retention", 
+      //todo 日志保留任务 定时清理失效的日志分段，并维护日志大小
+      scheduler.schedule("kafka-log-retention",
                          cleanupLogs, 
                          delay = InitialTaskDelayMs, 
                          period = retentionCheckMs, 
                          TimeUnit.MILLISECONDS)
       info("Starting log flusher with a default period of %d ms.".format(flushCheckMs))
-      scheduler.schedule("kafka-log-flusher", 
+      //todo 定时刷新还没写到磁盘上的日志,定期将页面缓存中的数据真正的写到磁盘的文件中。
+      // flushDirtyLogs 仅针对时间
+      // 执行刷新操作 消息追加到日志中，有两种场景会发送刷新日志的动作
+      // 新创建一个日志分段，立即刷新旧的日志分段
+      // 日志中未刷新的消息数量超过log.flush.interval.message = 10000的配置项
+      scheduler.schedule("kafka-log-flusher",
                          flushDirtyLogs, 
                          delay = InitialTaskDelayMs, 
                          period = flushCheckMs, 
                          TimeUnit.MILLISECONDS)
+      //todo 定时将所有数据目录所有日志的检查点写到检查点文件中
       scheduler.schedule("kafka-recovery-point-checkpoint",
                          checkpointRecoveryPointOffsets,
                          delay = InitialTaskDelayMs,
                          period = flushCheckpointMs,
                          TimeUnit.MILLISECONDS)
     }
-    if(cleanerConfig.enableCleaner)
+    if(cleanerConfig.enableCleaner) {
+      //根据 log.cleaner.enable 配置来决定是否启动LogCleaner
+      //定时压缩日志，相同键不同值的消息只保存最近一条
       cleaner.startup()
+    }
   }
 
   /**
@@ -319,6 +341,7 @@ class LogManager(val logDirs: Array[File],
    * Write out the current recovery point for all logs to a text file in the log directory 
    * to avoid recovering the whole log on startup.
    */
+  //所有数据目录都会一起执行
   def checkpointRecoveryPointOffsets() {
     this.logDirs.foreach(checkpointLogsInDir)
   }
@@ -327,6 +350,7 @@ class LogManager(val logDirs: Array[File],
    * Make a checkpoint for all logs in provided directory.
    */
   private def checkpointLogsInDir(dir: File): Unit = {
+    //dir 数据目录
     val recoveryPoints = this.logsByDir.get(dir.toString)
     if (recoveryPoints.isDefined) {
       this.recoveryPointCheckpoints(dir).write(recoveryPoints.get.mapValues(_.recoveryPoint))
@@ -348,6 +372,7 @@ class LogManager(val logDirs: Array[File],
    * Create a log for the given topic and the given partition
    * If the log already exists, just return a copy of the existing log
    */
+  //根据分区编号创建一个Log对象，并加入映射表中
   def createLog(topicAndPartition: TopicAndPartition, config: LogConfig): Log = {
     logCreationOrDeletionLock synchronized {
       var log = logs.get(topicAndPartition)
@@ -355,10 +380,11 @@ class LogManager(val logDirs: Array[File],
       // check if the log has already been created in another thread
       if(log != null)
         return log
-      
-      // if not, create it
+
+      //选择一个数据目录存储数据
       val dataDir = nextLogDir()
       val dir = new File(dataDir, topicAndPartition.topic + "-" + topicAndPartition.partition)
+      //创建文件夹
       dir.mkdirs()
       log = new Log(dir, 
                     config,
@@ -404,6 +430,7 @@ class LogManager(val logDirs: Array[File],
    */
   private def nextLogDir(): File = {
     if(logDirs.size == 1) {
+      //生产上一般配置一个
       logDirs(0)
     } else {
       // count the number of logs in each parent directory (including 0 for empty directories
@@ -449,12 +476,19 @@ class LogManager(val logDirs: Array[File],
   /**
    * Delete any eligible logs. Return the number of segments deleted.
    */
+  //todo 5 * 60 * 1000L 5 分钟执行一次
+  // 日志清理有两种策略
+  // 删除 delete 超过日志的阈值，直接物理删除整个日志分段
+  // 压缩 compact 不直接删除日志分段，而是采用合并压缩的方式
   def cleanupLogs() {
     debug("Beginning log cleanup...")
     var total = 0
     val startMs = time.milliseconds
     for(log <- allLogs; if !log.config.compact) {
       debug("Garbage collecting '" + log.name + "'")
+      //todo 删除旧的segment 时间超过7*24 或文件大小超过1g
+      //todo cleanupExpiredSegments 会根据存活时长判断是否要删除logsegment
+      //todo cleanupSegmentsToMaintainSize 会根据文件大小判断是否要删除logsegment
       total += cleanupExpiredSegments(log) + cleanupSegmentsToMaintainSize(log)
     }
     debug("Log cleanup completed. " + total + " files deleted in " +
@@ -474,6 +508,7 @@ class LogManager(val logDirs: Array[File],
   /**
    * Map of log dir to logs by topic and partitions in that dir
    */
+  //对数据目录进行分组，确保同一个数据目录下的所有日志会分在一个组
   private def logsByDir = {
     this.logsByTopicPartition.groupBy {
       case (_, log) => log.dir.getParent
@@ -488,9 +523,11 @@ class LogManager(val logDirs: Array[File],
 
     for ((topicAndPartition, log) <- logs) {
       try {
+        //距离上次刷新的时间
         val timeSinceLastFlush = time.milliseconds - log.lastFlushTime
         debug("Checking if flush is needed on " + topicAndPartition.topic + " flush interval  " + log.config.flushMs +
               " last flushed " + log.lastFlushTime + " time since last flush: " + timeSinceLastFlush)
+        //todo log.flush会执行 也就是由操作系统刷写数据
         if(timeSinceLastFlush >= log.config.flushMs)
           log.flush
       } catch {

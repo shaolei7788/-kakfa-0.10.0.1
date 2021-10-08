@@ -53,6 +53,9 @@ import kafka.common.InvalidOffsetException
  * All external APIs translate from relative offsets to full offsets, so users of this class do not interact with the internal 
  * storage format.
  */
+//快递定位指定偏移量在数据文件中的物理位置
+//稀疏索引可以通过内存映射的方式，将整个索引文件都放入内存，加快偏移量的查询
+// baseOffset 基础偏移量   maxIndexSize 默认10m
 class OffsetIndex(@volatile private[this] var _file: File, val baseOffset: Long, val maxIndexSize: Int = -1) extends Logging {
   
   private val lock = new ReentrantLock
@@ -133,11 +136,14 @@ class OffsetIndex(@volatile private[this] var _file: File, val baseOffset: Long,
    */
   def lookup(targetOffset: Long): OffsetPosition = {
     maybeLock(lock) {
+      //查询时mmp会发生变化，所以先复制出来
       val idx = mmap.duplicate
+      //通过二分查找 查找小于等于目标偏移量的最大偏移量
       val slot = indexSlotFor(idx, targetOffset)
-      if(slot == -1)
+      if(slot == -1) {
+        //没找到
         OffsetPosition(baseOffset, 0)
-      else
+      } else
         OffsetPosition(baseOffset + relativeOffset(idx, slot), physical(idx, slot))
       }
   }
@@ -151,18 +157,20 @@ class OffsetIndex(@volatile private[this] var _file: File, val baseOffset: Long,
    * 
    * @return The slot found or -1 if the least entry in the index is larger than the target offset or the index is empty
    */
+  //targetOffset目标偏移量
   private def indexSlotFor(idx: ByteBuffer, targetOffset: Long): Int = {
-    // we only store the difference from the base offset so calculate that
+    // 目标偏移量 - 基准偏移量 = 相对偏移量
     val relOffset = targetOffset - baseOffset
     
     // check if the index is empty
-    if (_entries == 0)
+    if (_entries == 0) {
+      //检测索引文件没有条目
       return -1
-    
-    // check if the target offset is smaller than the least offset
+    }
+    // 如果索引条目最小的偏移量都比目标偏移量要大，说明不在这个索引文件里
+    // relativeOffset 根据索引编号快速定位到偏移量的位置，然后读取这个索引条目的偏移量
     if (relativeOffset(idx, 0) > relOffset)
       return -1
-      
     // binary search for the entry
     var lo = 0
     var hi = _entries - 1
@@ -183,6 +191,7 @@ class OffsetIndex(@volatile private[this] var _file: File, val baseOffset: Long,
   private def relativeOffset(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * 8)
   
   /* return the nth physical position */
+  //会根据索引编号快速定位到物理位置，然后读取这个索引条目的物理位置
   private def physical(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * 8 + 4)
   
   /**
@@ -202,13 +211,18 @@ class OffsetIndex(@volatile private[this] var _file: File, val baseOffset: Long,
   /**
    * Append an entry for the given offset/location pair to the index. This entry must have a larger offset than all subsequent entries.
    */
+  // offset 添加消息的绝对偏移量
+  // position 添加消息在数据文件的物理位置
   def append(offset: Long, position: Int) {
     inLock(lock) {
       require(!isFull, "Attempt to append to a full index (size = " + _entries + ").")
       if (_entries == 0 || offset > _lastOffset) {
         debug("Adding index entry %d => %d to %s.".format(offset, position, _file.getName))
+        //todo offset - baseOffset 相对偏移量
         mmap.putInt((offset - baseOffset).toInt)
+        //todo position 是物理地址
         mmap.putInt(position)
+        //写索引的时候会记录两个位置信息，一个是offset 相对偏移量,一个pistion 物理地址
         _entries += 1
         _lastOffset = offset
         require(_entries * 8 == mmap.position, _entries + " entries but file position in index is " + mmap.position + ".")

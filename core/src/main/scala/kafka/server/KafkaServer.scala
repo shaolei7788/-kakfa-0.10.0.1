@@ -170,36 +170,41 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime, threadNamePr
       val canStartup = isStartingUp.compareAndSet(false, true)
       if (canStartup) {
         metrics = new Metrics(metricConfig, reporters, kafkaMetricsTime, true)
-
+        //设置broker的状态为 Starting
         brokerState.newState(Starting)
 
         /* start scheduler */
         kafkaScheduler.startup()
 
-        /* setup zookeeper */
+        //初始化zk
         zkUtils = initZk()
 
-        /* start log manager */
+        //todo 创建日志管理器，
+        // 1 读取检查点文件，并把每个分区对应的检查点作为日志的恢复点，最后创建分区对应的日志实例
+        // 2 消息追加到分区对应的日志，在刷新日志时，将最新的偏移量作为日志检查点
+        // 3 日志管理器会启动一个定时任务，读取所有的日志检查点，并写入全局的检查点文件
+        // 会调用 LogManager#loadLogs  该方法会topic-partition test-0 创建Log目录
+        // 会继续调用Log#loadSegments  加载所有的日志分段
         logManager = createLogManager(zkUtils.zkClient, brokerState)
         logManager.startup()
 
         /* generate brokerId */
         config.brokerId =  getBrokerId
         this.logIdent = "[Kafka Server " + config.brokerId + "], "
-
+        //todo socket server 服务端
         socketServer = new SocketServer(config, metrics, kafkaMetricsTime)
         socketServer.startup()
 
-        /* start replica manager */
+        //todo 副本管理器
         replicaManager = new ReplicaManager(config, metrics, time, kafkaMetricsTime, zkUtils, kafkaScheduler, logManager,
           isShuttingDown)
         replicaManager.startup()
 
-        /* start kafka controller */
+        //todo 创建kafka控制器  threadNamePrefix 默认是None
         kafkaController = new KafkaController(config, zkUtils, brokerState, kafkaMetricsTime, metrics, threadNamePrefix)
         kafkaController.startup()
 
-        /* start group coordinator */
+        //todo 创建协调者
         groupCoordinator = GroupCoordinator(config, zkUtils, replicaManager, kafkaMetricsTime)
         groupCoordinator.startup()
 
@@ -213,6 +218,8 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime, threadNamePr
         /* start processing requests */
         apis = new KafkaApis(socketServer.requestChannel, replicaManager, groupCoordinator,
           kafkaController, zkUtils, config.brokerId, config, metadataCache, metrics, authorizer)
+
+        //todo 创建KafkaRequestHandlerPool
         requestHandlerPool = new KafkaRequestHandlerPool(config.brokerId, socketServer.requestChannel, apis, config.numIoThreads)
         brokerState.newState(RunningAsBroker)
 
