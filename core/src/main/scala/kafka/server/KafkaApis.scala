@@ -50,6 +50,7 @@ import org.apache.kafka.common.requests.SaslHandshakeResponse
 /**
  * Logic to handle the various Kafka requests
  */
+//是服务端处理所有请求的入口
 class KafkaApis(val requestChannel: RequestChannel,
                 val replicaManager: ReplicaManager,
                 val coordinator: GroupCoordinator,
@@ -73,19 +74,29 @@ class KafkaApis(val requestChannel: RequestChannel,
       trace("Handling request:%s from connection %s;securityProtocol:%s,principal:%s".
         format(request.requestDesc(true), request.connectionId, request.securityProtocol, request.session.principal))
       ApiKeys.forId(request.requestId) match {
+        //todo 生产者生产消息
         case ApiKeys.PRODUCE => handleProducerRequest(request)
+        //todo 消费者拉取数据 或者follower副本拉取数据 FETCH
         case ApiKeys.FETCH => handleFetchRequest(request)
+        //todo 消费者列举偏移量 从分区主副本拉取
         case ApiKeys.LIST_OFFSETS => handleOffsetRequest(request)
         case ApiKeys.METADATA => handleTopicMetadataRequest(request)
+        //todo 请求控制副本的leader follower 切换
         case ApiKeys.LEADER_AND_ISR => handleLeaderAndIsrRequest(request)
         case ApiKeys.STOP_REPLICA => handleStopReplicaRequest(request)
         case ApiKeys.UPDATE_METADATA_KEY => handleUpdateMetadataRequest(request)
         case ApiKeys.CONTROLLED_SHUTDOWN_KEY => handleControlledShutdownRequest(request)
+        //todo 消费者提交偏移量  从Coodinator拉取
         case ApiKeys.OFFSET_COMMIT => handleOffsetCommitRequest(request)
+        //todo 消费者拉取偏移量 从Coodinator拉取
         case ApiKeys.OFFSET_FETCH => handleOffsetFetchRequest(request)
+        //todo 消费者 查找 group_coordinator
         case ApiKeys.GROUP_COORDINATOR => handleGroupCoordinatorRequest(request)
+        //todo 消费者加入group
         case ApiKeys.JOIN_GROUP => handleJoinGroupRequest(request)
+        //todo 消费者发送心跳
         case ApiKeys.HEARTBEAT => handleHeartbeatRequest(request)
+        //todo 消费者离开group
         case ApiKeys.LEAVE_GROUP => handleLeaveGroupRequest(request)
         case ApiKeys.SYNC_GROUP => handleSyncGroupRequest(request)
         case ApiKeys.DESCRIBE_GROUPS => handleDescribeGroupRequest(request)
